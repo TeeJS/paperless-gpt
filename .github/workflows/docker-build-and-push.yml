@@ -142,7 +142,7 @@ jobs:
         run: |
           # Set repository names
           DOCKERHUB_REPO="icereed/paperless-gpt"
-          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY}"
+          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           
           # For forks, only use GHCR
           if [[ "${GITHUB_REPOSITORY}" != "icereed/paperless-gpt" ]]; then
@@ -221,7 +221,7 @@ jobs:
         run: |
           # Set repository names
           DOCKERHUB_REPO="icereed/paperless-gpt"
-          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY}"
+          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           
           # For forks, only use GHCR
           if [[ "${GITHUB_REPOSITORY}" != "icereed/paperless-gpt" ]]; then
@@ -269,8 +269,11 @@ jobs:
     if: github.event_name != 'pull_request'
     env:
       DOCKERHUB_REPO: icereed/paperless-gpt
-      GHCR_REPO: ghcr.io/${{ github.repository }}
     steps:
+      - name: Set lowercase GHCR repo
+        # OCI repository names must be lowercase; ${{ github.repository }} preserves
+        # the owner's casing (e.g. TeeJS), so normalize it here.
+        run: echo "GHCR_REPO=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Download amd64 digest
         uses: actions/download-artifact@v7
         with:
@@ -376,7 +379,7 @@ jobs:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
       - name: Set PAPERLESS_GPT_IMAGE
         run: |
-          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY}"
+          GHCR_REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
             IMAGE="${GHCR_REPO}:pr-${GITHUB_SHA}-amd64"
           elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
