@@ -78,6 +78,11 @@ Content: {{.Content}}
 Language: {{.Language}}
 Content: {{.Content}}
 `
+	testDocumentTypeTemplate = `
+Language: {{.Language}}
+Document Types: {{.AvailableDocumentTypes}}
+Content: {{.Content}}
+`
 	testCreatedDateContentTemplate = `
 Language: {{.Language}}
 Content: {{.Content}}
@@ -327,6 +332,97 @@ func TestCreateNewTagsFiltering(t *testing.T) {
 		for _, tag := range tags {
 			assert.NotEmpty(t, tag)
 		}
+	})
+}
+
+func TestCreateNewCorrespondentsFiltering(t *testing.T) {
+	// Initialize correspondent template for this test
+	var err error
+	correspondentTemplate, err = template.New("correspondent").Parse(testCorrespondentTemplate)
+	require.NoError(t, err)
+
+	// Save and restore createNewCorrespondents
+	originalCreateNewCorrespondents := createNewCorrespondents
+	defer func() { createNewCorrespondents = originalCreateNewCorrespondents }()
+
+	ctx := context.Background()
+	availableCorrespondents := []string{"Microsoft", "Amazon"}
+	blackList := []string{}
+
+	t.Run("createNewCorrespondents allows new correspondents", func(t *testing.T) {
+		createNewCorrespondents = true
+		mockLLM := &mockLLM{Response: "NewCompany"}
+		app := &App{LLM: mockLLM}
+
+		correspondent, err := app.getSuggestedCorrespondent(ctx, "Some document content", "Test Title", availableCorrespondents, blackList)
+		require.NoError(t, err)
+		assert.Equal(t, "NewCompany", correspondent)
+	})
+
+	t.Run("disabled filters out new correspondents", func(t *testing.T) {
+		createNewCorrespondents = false
+		mockLLM := &mockLLM{Response: "NewCompany"}
+		app := &App{LLM: mockLLM}
+
+		correspondent, err := app.getSuggestedCorrespondent(ctx, "Some document content", "Test Title", availableCorrespondents, blackList)
+		require.NoError(t, err)
+		assert.Equal(t, "", correspondent)
+	})
+
+	t.Run("disabled preserves existing correspondent casing", func(t *testing.T) {
+		createNewCorrespondents = false
+		mockLLM := &mockLLM{Response: "microsoft"}
+		app := &App{LLM: mockLLM}
+
+		correspondent, err := app.getSuggestedCorrespondent(ctx, "Some document content", "Test Title", availableCorrespondents, blackList)
+		require.NoError(t, err)
+		assert.Equal(t, "Microsoft", correspondent)
+	})
+}
+
+func TestCreateNewDocumentTypeFiltering(t *testing.T) {
+	testLogger := logrus.WithField("test", "test")
+
+	// Initialize document type template for this test
+	var err error
+	documentTypeTemplate, err = template.New("document_type").Parse(testDocumentTypeTemplate)
+	require.NoError(t, err)
+
+	// Save and restore createNewDocumentType
+	originalCreateNewDocumentType := createNewDocumentType
+	defer func() { createNewDocumentType = originalCreateNewDocumentType }()
+
+	ctx := context.Background()
+	availableDocumentTypes := []string{"Invoice", "Receipt"}
+
+	t.Run("default filters out new document types", func(t *testing.T) {
+		createNewDocumentType = false
+		mockLLM := &mockLLM{Response: "Contract"}
+		app := &App{LLM: mockLLM}
+
+		docType, err := app.getSuggestedDocumentType(ctx, "Some document content", "Test Title", availableDocumentTypes, testLogger)
+		require.NoError(t, err)
+		assert.Equal(t, "", docType)
+	})
+
+	t.Run("createNewDocumentType allows new document types", func(t *testing.T) {
+		createNewDocumentType = true
+		mockLLM := &mockLLM{Response: "Contract"}
+		app := &App{LLM: mockLLM}
+
+		docType, err := app.getSuggestedDocumentType(ctx, "Some document content", "Test Title", availableDocumentTypes, testLogger)
+		require.NoError(t, err)
+		assert.Equal(t, "Contract", docType)
+	})
+
+	t.Run("existing document type is returned with canonical casing", func(t *testing.T) {
+		createNewDocumentType = true
+		mockLLM := &mockLLM{Response: "invoice"}
+		app := &App{LLM: mockLLM}
+
+		docType, err := app.getSuggestedDocumentType(ctx, "Some document content", "Test Title", availableDocumentTypes, testLogger)
+		require.NoError(t, err)
+		assert.Equal(t, "Invoice", docType)
 	})
 }
 

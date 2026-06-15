@@ -29,6 +29,7 @@ func (app *App) getSuggestedCorrespondent(ctx context.Context, content string, s
 		"AvailableCorrespondents": availableCorrespondents,
 		"BlackList":               correspondentBlackList,
 		"Title":                   suggestedTitle,
+		"CreateNewCorrespondents": createNewCorrespondents,
 	}
 
 	availableTokens, err := getAvailableTokensForContent(correspondentTemplate, templateData)
@@ -68,6 +69,21 @@ func (app *App) getSuggestedCorrespondent(ctx context.Context, content string, s
 	}
 
 	response := stripReasoning(strings.TrimSpace(completion.Choices[0].Content))
+
+	// When creating new correspondents is disabled, only allow correspondents that
+	// already exist in paperless-ngx so nothing new gets created downstream.
+	if !createNewCorrespondents {
+		for _, correspondent := range availableCorrespondents {
+			if strings.EqualFold(response, correspondent) {
+				return correspondent, nil // Return the exact name from available correspondents
+			}
+		}
+		if response != "" {
+			log.Warnf("LLM suggested correspondent '%s' not found in available correspondents and CREATE_NEW_CORRESPONDENTS is disabled, ignoring", response)
+		}
+		return "", nil
+	}
+
 	return response, nil
 }
 
@@ -91,11 +107,11 @@ func (app *App) getSuggestedTags(
 
 	// Get available tokens for content
 	templateData := map[string]interface{}{
-		"Language":       likelyLanguage,
-		"AvailableTags":  availableTags,
-		"OriginalTags":   originalTags,
-		"Title":          suggestedTitle,
-		"CreateNewTags":  createNewTags,
+		"Language":      likelyLanguage,
+		"AvailableTags": availableTags,
+		"OriginalTags":  originalTags,
+		"Title":         suggestedTitle,
+		"CreateNewTags": createNewTags,
 	}
 
 	availableTokens, err := getAvailableTokensForContent(tagTemplate, templateData)
@@ -204,6 +220,7 @@ func (app *App) getSuggestedDocumentType(
 		"Language":               likelyLanguage,
 		"AvailableDocumentTypes": availableDocumentTypes,
 		"Title":                  suggestedTitle,
+		"CreateNewDocumentType":  createNewDocumentType,
 	}
 
 	availableTokens, err := getAvailableTokensForContent(documentTypeTemplate, templateData)
@@ -253,6 +270,12 @@ func (app *App) getSuggestedDocumentType(
 		if strings.EqualFold(response, docType) {
 			return docType, nil // Return the exact name from available types
 		}
+	}
+
+	// When creating new document types is enabled, keep a non-empty suggestion that
+	// isn't in the existing list so it can be created downstream.
+	if createNewDocumentType && response != "" {
+		return response, nil
 	}
 
 	// If not found in available types, return empty string

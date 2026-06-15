@@ -1,7 +1,12 @@
 I will provide you with the content and the title of a document.
 Your task is to select the most appropriate document type for the document from the list of available document types I will provide.
-Only select a document type from the provided list. Respond only with the selected document type name, without any additional information.
-If none of the available document types fit the document, respond with an empty string.
+{{- if .CreateNewDocumentType}}
+Prefer an existing document type from the provided list. If none of them fit, you may suggest a new, concise document type name.
+{{- else}}
+Only select a document type from the provided list.
+{{- end}}
+Respond only with the selected document type name, without any additional information.
+If you cannot determine an appropriate document type, respond with an empty string.
 The content is likely in {{.Language}}.
 
 The data will be provided using an XML-like format for clarity:
@@ -18,5 +23,9 @@ The data will be provided using an XML-like format for clarity:
 {{.Content}}
 </content>
 
+{{- if .CreateNewDocumentType}}
+Please select the single most appropriate {{.Language}} document type that best categorizes this document, preferring the list above but suggesting a new one only if nothing fits.
+{{- else}}
 Please select the single most appropriate {{.Language}} document type from the list above that best categorizes this document.
+{{- end}}
 Be selective and only choose a document type if it clearly matches the document's nature (e.g., Invoice, Contract, Receipt, Letter, etc.).

@@ -539,27 +539,41 @@ func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []
 
 		// --- CORRESPONDENT ---
 		if document.SuggestedCorrespondent != "" && document.SuggestedCorrespondent != originalDoc.Correspondent {
-			originalFields["correspondent"] = originalDoc.Correspondent
 			if corrID, exists := availableCorrespondents[document.SuggestedCorrespondent]; exists {
+				originalFields["correspondent"] = originalDoc.Correspondent
 				updatedFields["correspondent"] = corrID
-			} else {
+			} else if createNewCorrespondents {
 				newCorr := instantiateCorrespondent(document.SuggestedCorrespondent)
 				newCorrID, err := client.CreateOrGetCorrespondent(ctx, newCorr)
 				if err != nil {
 					return fmt.Errorf("error creating correspondent '%s': %w", document.SuggestedCorrespondent, err)
 				}
+				availableCorrespondents[document.SuggestedCorrespondent] = newCorrID
+				originalFields["correspondent"] = originalDoc.Correspondent
 				updatedFields["correspondent"] = newCorrID
+			} else {
+				// CREATE_NEW_CORRESPONDENTS is disabled, so don't create a new correspondent
+				log.Warnf("Correspondent '%s' not found in available correspondents and CREATE_NEW_CORRESPONDENTS is disabled, skipping for document %d", document.SuggestedCorrespondent, documentID)
 			}
 		}
 
 		// --- DOCUMENT TYPE ---
 		if document.SuggestedDocumentType != "" && document.SuggestedDocumentType != originalDoc.DocumentTypeName {
-			originalFields["document_type"] = originalDoc.DocumentTypeName
 			if docTypeID, exists := availableDocumentTypes[document.SuggestedDocumentType]; exists {
+				originalFields["document_type"] = originalDoc.DocumentTypeName
 				updatedFields["document_type"] = docTypeID
+			} else if createNewDocumentType {
+				newDocTypeID, err := client.CreateOrGetDocumentType(ctx, document.SuggestedDocumentType)
+				if err != nil {
+					return fmt.Errorf("error creating document type '%s': %w", document.SuggestedDocumentType, err)
+				}
+				log.Infof("Document %d: Created or fetched document type '%s' with ID %d", documentID, document.SuggestedDocumentType, newDocTypeID)
+				availableDocumentTypes[document.SuggestedDocumentType] = newDocTypeID
+				originalFields["document_type"] = originalDoc.DocumentTypeName
+				updatedFields["document_type"] = newDocTypeID
 			} else {
-				// Unlike correspondents, we don't create new document types - only use existing ones
-				log.Warnf("Document type '%s' not found in available types, skipping for document %d", document.SuggestedDocumentType, documentID)
+				// CREATE_NEW_DOCUMENT_TYPE is disabled, so only use existing document types
+				log.Warnf("Document type '%s' not found in available types and CREATE_NEW_DOCUMENT_TYPE is disabled, skipping for document %d", document.SuggestedDocumentType, documentID)
 			}
 		}
 
@@ -1241,6 +1255,50 @@ func (client *PaperlessClient) GetAllDocumentTypes(ctx context.Context) ([]Docum
 	allDocumentTypes = append(allDocumentTypes, response.Results...)
 
 	return allDocumentTypes, nil
+}
+
+// CreateOrGetDocumentType creates a new document type or returns the existing one if the name already exists
+func (client *PaperlessClient) CreateOrGetDocumentType(ctx context.Context, name string) (int, error) {
+	// First try to find an existing document type with this name
+	documentTypes, err := client.GetAllDocumentTypes(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("error fetching document types: %w", err)
+	}
+	for _, dt := range documentTypes {
+		if strings.EqualFold(dt.Name, name) {
+			log.Infof("Using existing document type with name %s and ID %d", dt.Name, dt.ID)
+			return dt.ID, nil
+		}
+	}
+
+	// If not found, create a new document type
+	type documentTypeRequest struct {
+		Name string `json:"name"`
+	}
+	requestBody, err := json.Marshal(documentTypeRequest{Name: name})
+	if err != nil {
+		return 0, fmt.Errorf("error marshaling document type request: %w", err)
+	}
+
+	resp, err := client.Do(ctx, "POST", "api/document_types/", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return 0, fmt.Errorf("error creating document type: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("error creating document type: %d, %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var createdDocumentType struct {
+		ID int `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&createdDocumentType); err != nil {
+		return 0, fmt.Errorf("error parsing created document type response: %w", err)
+	}
+
+	return createdDocumentType.ID, nil
 }
 
 // GetCustomFields retrieves all custom fields from the Paperless-NGX API
