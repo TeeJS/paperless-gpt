@@ -170,7 +170,8 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          outputs: type=image,oci-mediatypes=false,push=${{ github.event_name != 'pull_request' }}
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ env.TAGS }}
@@ -245,7 +246,8 @@ jobs:
         with:
           context: .
           platforms: linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          outputs: type=image,oci-mediatypes=false,push=${{ github.event_name != 'pull_request' }}
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: ${{ env.TAGS }}
