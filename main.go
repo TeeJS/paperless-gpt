@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"paperless-gpt/ocr"
+	"paperless-gpt/sanitize"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -48,8 +49,10 @@ var (
 	openaiAPIKey                  = os.Getenv("OPENAI_API_KEY")
 	manualTag                     = os.Getenv("MANUAL_TAG")
 	autoTag                       = os.Getenv("AUTO_TAG")
+	autoTagComplete               string // read via os.LookupEnv in validateOrDefaultEnvVars
 	manualOcrTag                  = os.Getenv("MANUAL_OCR_TAG") // Not used yet
 	autoOcrTag                    = os.Getenv("AUTO_OCR_TAG")
+	failTag                       = os.Getenv("FAIL_TAG")
 	ocrProcessMode                = os.Getenv("OCR_PROCESS_MODE")
 	llmProvider                   = os.Getenv("LLM_PROVIDER")
 	llmModel                      = os.Getenv("LLM_MODEL")
@@ -140,6 +143,7 @@ type App struct {
 	pdfOCRCompleteTag  string            // Tag to add to documents that have been OCR processed
 	pdfOCRTagging      bool              // Whether to add the OCR complete tag to processed PDFs
 	pdfSkipExistingOCR bool              // Whether to skip processing PDFs that already have OCR detected
+	autoTagComplete    string            // Tag to add to documents after auto-processing is complete
 }
 
 func main() {
@@ -153,6 +157,11 @@ func main() {
 	// Initialize logrus logger
 	initLogger()
 
+	// Initialize content sanitization
+	if err := sanitize.Init(); err != nil {
+		log.Fatalf("Failed to initialize sanitization: %v", err)
+	}
+
 	// Load settings from file
 	loadSettings()
 
@@ -165,6 +174,15 @@ func main() {
 
 	// Initialize PaperlessClient
 	client := NewPaperlessClient(paperlessBaseURL, paperlessAPIToken)
+
+	// Ensure the fail tag exists in paperless-ngx. paperless-gpt applies this
+	// tag mechanically when document processing fails (see processAutoTagDocuments),
+	// so it must be available regardless of the CREATE_NEW_TAGS setting.
+	// A failure here is logged but non-fatal: the loop-break path still removes
+	// the auto tag, the fail tag is just not applied.
+	if err := client.EnsureTagExists(ctx, failTag); err != nil {
+		log.Warnf("Failed to ensure fail tag %q exists: %v. Recovery from a failed document update will still remove the auto tag (loop break works), but the fail tag will not be added.", failTag, err)
+	}
 
 	// Initial fetch of custom fields
 	refreshCustomFieldsCache(client)
@@ -210,12 +228,15 @@ func main() {
 		providerType = "llm" // Default to LLM provider
 	}
 
+	// Render OCR prompt with empty Content as fallback for the provider default.
+	// Per-document rendering (with existing content) happens in ProcessDocumentOCR.
 	var promptBuffer bytes.Buffer
 	err = ocrTemplate.Execute(&promptBuffer, map[string]interface{}{
 		"Language": getLikelyLanguage(),
+		"Content":  "",
 	})
 	if err != nil {
-		log.Fatalf("error executing tag template: %v", err)
+		log.Fatalf("error executing OCR template: %v", err)
 	}
 
 	ocrPrompt := promptBuffer.String()
@@ -339,6 +360,7 @@ func main() {
 		pdfOCRCompleteTag:  pdfOCRCompleteTag,
 		pdfOCRTagging:      pdfOCRTagging,
 		pdfSkipExistingOCR: pdfSkipExistingOCR,
+		autoTagComplete:    autoTagComplete,
 	}
 
 	if app.isOcrEnabled() {
@@ -585,8 +607,24 @@ func validateOrDefaultEnvVars() {
 		autoOcrTag = "paperless-gpt-ocr-auto"
 	}
 
+	if failTag == "" {
+		failTag = "paperless-gpt-failed"
+	}
+	fmt.Printf("Using %s as fail tag\n", failTag)
+
 	if pdfOCRCompleteTag == "" {
 		pdfOCRCompleteTag = "paperless-gpt-ocr-complete"
+	}
+
+	if val, ok := os.LookupEnv("AUTO_TAG_COMPLETE"); ok {
+		autoTagComplete = val
+	} else {
+		autoTagComplete = "paperless-gpt-auto-complete"
+	}
+	if autoTagComplete != "" {
+		fmt.Printf("Using %s as auto tag complete\n", autoTagComplete)
+	} else {
+		fmt.Println("Auto tag complete is disabled")
 	}
 
 	if paperlessBaseURL == "" {
@@ -971,6 +1009,10 @@ func createLLM() (llms.Model, error) {
 				openai.WithBaseURL(baseURL),
 				openai.WithEmbeddingModel("this-is-not-used"), // This is mandatory for Azure by langchain-go
 			)
+		} else if baseURL := os.Getenv("OPENAI_BASE_URL"); baseURL != "" {
+			// OpenAI-compatible endpoints (OpenRouter, LiteLLM, vLLM, mock
+			// servers in E2E tests, ...)
+			options = append(options, openai.WithBaseURL(baseURL))
 		}
 
 		llm, err := openai.New(options...)
@@ -995,6 +1037,19 @@ func createLLM() (llms.Model, error) {
 			} else if err != nil {
 				log.Warnf("Invalid OLLAMA_CONTEXT_LENGTH value: %v, ignoring", err)
 			}
+		}
+		if thinkStr := os.Getenv("OLLAMA_THINK"); thinkStr != "" {
+			// Allow disabling Ollama reasoning mode for tasks where format
+			// compliance matters more than chain-of-thought (closed-list
+			// classification, strict JSON). Unset = upstream default behavior.
+			if parsed, err := strconv.ParseBool(thinkStr); err == nil {
+				opts = append(opts, ollama.WithThink(parsed))
+			} else {
+				log.Warnf("Invalid OLLAMA_THINK value: %v, ignoring (must be true/false)", err)
+			}
+		}
+		if client := ocr.OllamaHTTPClient(); client != nil {
+			opts = append(opts, ollama.WithHTTPClient(client))
 		}
 		llm, err := ollama.New(opts...)
 		if err != nil {
@@ -1079,6 +1134,10 @@ func createVisionLLM() (llms.Model, error) {
 				openai.WithBaseURL(baseURL),
 				openai.WithEmbeddingModel("this-is-not-used"), // This is mandatory for Azure by langchain-go
 			)
+		} else if baseURL := os.Getenv("OPENAI_BASE_URL"); baseURL != "" {
+			// OpenAI-compatible endpoints (OpenRouter, LiteLLM, vLLM, mock
+			// servers in E2E tests, ...)
+			options = append(options, openai.WithBaseURL(baseURL))
 		}
 
 		llm, err := openai.New(options...)
@@ -1103,6 +1162,9 @@ func createVisionLLM() (llms.Model, error) {
 			} else if err != nil {
 				log.Warnf("Invalid OLLAMA_CONTEXT_LENGTH value: %v, ignoring", err)
 			}
+		}
+		if client := ocr.OllamaHTTPClient(); client != nil {
+			opts = append(opts, ollama.WithHTTPClient(client))
 		}
 		llm, err := ollama.New(opts...)
 		if err != nil {
@@ -1140,6 +1202,7 @@ func createVisionLLM() (llms.Model, error) {
 	}
 }
 
+
 func createCustomHTTPClient() *http.Client {
 	// Create custom transport that adds headers
 	customTransport := &headerTransport{
@@ -1164,8 +1227,9 @@ type headerTransport struct {
 
 // RoundTrip implements the http.RoundTripper interface
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
 	for key, value := range t.headers {
-		req.Header.Add(key, value)
+		req.Header.Set(key, value)
 	}
 	return t.transport.RoundTrip(req)
 }

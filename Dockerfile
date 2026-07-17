@@ -56,6 +56,8 @@ COPY --from=frontend /app/dist /app/web-app/dist
 # Copy the Go source files
 COPY *.go .
 COPY ocr ./ocr
+COPY sanitize ./sanitize
+COPY internal ./internal
 
 # Import ARGs from top level
 ARG VERSION
@@ -79,7 +81,8 @@ ENV GIN_MODE=release
 
 # Install necessary runtime dependencies
 RUN apk add --no-cache \
-    ca-certificates
+    ca-certificates \
+    su-exec
 
 # Set the working directory inside the container
 WORKDIR /app/
@@ -87,11 +90,15 @@ WORKDIR /app/
 # Copy the Go binary from the builder stage
 COPY --from=builder /app/paperless-gpt .
 
+# Copy the entrypoint script
+COPY entrypoint.sh .
+RUN chmod +x ./entrypoint.sh
+
 # Copy the prompt templates
 COPY default_prompts/ /app/default_prompts/
 
 # Expose the port the app runs on
 EXPOSE 8080
 
-# Command to run the binary
-CMD ["/app/paperless-gpt"]
+# Set the entrypoint
+ENTRYPOINT ["./entrypoint.sh"]
