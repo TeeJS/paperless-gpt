@@ -241,6 +241,9 @@ func (app *App) processAutoTagDocuments(ctx context.Context) (int, error) {
 		}
 
 		docLogger.Info("Successfully processed document")
+		if len(suggestions) == 1 && suggestions[0].ClearTriage {
+			app.removeTriageTags(ctx, document.ID, docLogger)
+		}
 		processedCount++
 	}
 

@@ -129,6 +129,9 @@ type DocumentSuggestion struct {
 	AddTags                []string                `json:"add_tags,omitempty"`
 	CustomFieldsWriteMode  string                  `json:"custom_fields_write_mode,omitempty"`
 	CustomFieldsEnable     bool                    `json:"custom_fields_enable"`
+	// ClearTriage is set on auto-processing runs that fully triaged the document
+	// (see triageComplete); never sent to or from the web UI.
+	ClearTriage bool `json:"-"`
 }
 
 type Correspondent struct {
@@ -142,8 +145,8 @@ type Correspondent struct {
 	// produces ownerless correspondents — they still appear in the
 	// correspondents list, but documents assigned to them are shown as
 	// "private" in the UI instead of the correspondent name.
-	Owner             *int   `json:"owner,omitempty"`
-	SetPermissions    struct {
+	Owner          *int `json:"owner,omitempty"`
+	SetPermissions struct {
 		View struct {
 			Users  []int `json:"users"`
 			Groups []int `json:"groups"`
