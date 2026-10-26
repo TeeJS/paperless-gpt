@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"paperless-gpt/internal/textsanitize"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -176,6 +177,10 @@ func (app *App) getSuggestedTagsDetailed(
 	for i, tag := range suggestedTags {
 		suggestedTags[i] = strings.TrimSpace(tag)
 	}
+
+	// Drop year tags the model invented: a 4-digit year tag is kept only if
+	// that year is actually written in the content it was shown.
+	suggestedTags = filterUnsupportedYearTags(suggestedTags, truncatedContent, logger)
 
 	// Keep what the model itself answered, before original tags are merged in,
 	// so triageComplete can tell a fresh year tag from an old one.
@@ -879,4 +884,34 @@ func (app *App) removeTriageTags(ctx context.Context, documentID int, docLogger 
 		return
 	}
 	docLogger.Infof("Removed triage tags %v from document %d", autoRemoveTags, documentID)
+}
+
+// filterUnsupportedYearTags removes 4-digit year tags (e.g. "2024") that do not
+// appear in content, either as the full year or as a 2-digit year at the end of
+// a numeric date (e.g. "06/06/19" for 2019). Non-year tags pass through.
+func filterUnsupportedYearTags(tags []string, content string, logger *logrus.Entry) []string {
+	kept := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if isYearTagName(tag) && !yearInContent(strings.TrimSpace(tag), content) {
+			if logger != nil {
+				logger.Infof("Dropping year tag %q: year not found in document content", tag)
+			}
+			continue
+		}
+		kept = append(kept, tag)
+	}
+	return kept
+}
+
+// yearInContent reports whether a 4-digit year is written in content.
+func yearInContent(year, content string) bool {
+	if len(year) != 4 {
+		return false
+	}
+	full := regexp.MustCompile(`(^|[^0-9])` + regexp.QuoteMeta(year) + `([^0-9]|$)`)
+	if full.MatchString(content) {
+		return true
+	}
+	short := regexp.MustCompile(`(^|[^0-9])[0-9]{1,2}[/.\-][0-9]{1,2}[/.\-]` + regexp.QuoteMeta(year[2:]) + `([^0-9]|$)`)
+	return short.MatchString(content)
 }
