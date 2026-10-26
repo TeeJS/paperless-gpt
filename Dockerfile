@@ -25,20 +25,18 @@ COPY web-app /app/
 RUN npm run build
 
 # Stage 2: Build the Go binary
-FROM docker.io/golang:1.25.5-alpine3.21 AS builder
+FROM docker.io/golang:1.27.2-alpine3.24 AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
 
 # Install build dependencies.
-# Versions are intentionally unpinned: the alpine3.21 base image already bounds
-# these to the Alpine 3.21 branch, and pinned -rN revisions get purged from the
+# Versions are intentionally unpinned: the alpine3.24 base image already bounds
+# these to the Alpine 3.24 branch, and pinned -rN revisions get purged from the
 # mirror over time (this fork has no Renovate to keep exact pins fresh).
 RUN apk add --no-cache \
     gcc \
     musl-dev \
-    mupdf \
-    mupdf-dev \
     sed
 
 # Copy go.mod and go.sum files
@@ -75,7 +73,7 @@ RUN sed -i \
 RUN CGO_ENABLED=1 GOMAXPROCS=$(nproc) go build -tags musl -o paperless-gpt .
 
 # Stage 3: Create a lightweight image with just the binary
-FROM docker.io/alpine:3.23.0
+FROM docker.io/alpine:3.24.2
 
 ENV GIN_MODE=release
 

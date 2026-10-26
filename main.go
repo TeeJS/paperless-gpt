@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
+	"paperless-gpt/internal/pdfrender"
 	"paperless-gpt/ocr"
 	"paperless-gpt/sanitize"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +43,7 @@ var (
 	// Environment Variables
 	paperlessInsecureSkipVerify   = os.Getenv("PAPERLESS_INSECURE_SKIP_VERIFY") == "true"
 	correspondentBlackList        = strings.Split(os.Getenv("CORRESPONDENT_BLACK_LIST"), ",")
+	correspondentPromptLimit      int // Will be read from CORRESPONDENT_PROMPT_LIMIT
 	paperlessBaseURL              = os.Getenv("PAPERLESS_BASE_URL")
 	paperlessAPIToken             = os.Getenv("PAPERLESS_API_TOKEN")
 	azureDocAIEndpoint            = os.Getenv("AZURE_DOCAI_ENDPOINT")
@@ -49,9 +54,8 @@ var (
 	openaiAPIKey                  = os.Getenv("OPENAI_API_KEY")
 	manualTag                     = os.Getenv("MANUAL_TAG")
 	autoTag                       = os.Getenv("AUTO_TAG")
-	autoTagComplete               string                        // read via os.LookupEnv in validateOrDefaultEnvVars
-	autoRemoveTags                []string                      // AUTO_REMOVE_TAGS: removed only after a fully successful auto-processing run
-	manualOcrTag                  = os.Getenv("MANUAL_OCR_TAG") // Not used yet
+	autoTagComplete               string   // read via os.LookupEnv in validateOrDefaultEnvVars
+	autoRemoveTags                []string // AUTO_REMOVE_TAGS: removed only after a fully successful auto-processing run
 	autoOcrTag                    = os.Getenv("AUTO_OCR_TAG")
 	failTag                       = os.Getenv("FAIL_TAG")
 	ocrProcessMode                = os.Getenv("OCR_PROCESS_MODE")
@@ -70,28 +74,33 @@ var (
 	// Default true to preserve existing behavior (correspondents have always been auto-created); set to "false" to prevent.
 	createNewCorrespondents = os.Getenv("CREATE_NEW_CORRESPONDENTS") != "false"
 	// Default false to preserve existing behavior (document types have never been auto-created); set to "true" to enable.
-	createNewDocumentType  = os.Getenv("CREATE_NEW_DOCUMENT_TYPE") == "true"
-	limitOcrPages          int // Will be read from OCR_LIMIT_PAGES
-	tokenLimit             = 0 // Will be read from TOKEN_LIMIT
-	imageMaxPixelDimension int // Will be read from IMAGE_MAX_PIXEL_DIMENSION
-	imageMaxTotalPixels    int // Will be read from IMAGE_MAX_TOTAL_PIXELS
-	imageMaxRenderDPI      int // Will be read from IMAGE_MAX_RENDER_DPI
-	imageMaxFileBytes      int // Will be read from IMAGE_MAX_FILE_BYTES
-	createLocalHOCR        = os.Getenv("CREATE_LOCAL_HOCR") == "true"
-	createLocalPDF         = os.Getenv("CREATE_LOCAL_PDF") == "true"
-	localHOCRPath          = os.Getenv("LOCAL_HOCR_PATH")
-	localPDFPath           = os.Getenv("LOCAL_PDF_PATH")
-	pdfUpload              = os.Getenv("PDF_UPLOAD") == "true"
-	pdfReplace             = os.Getenv("PDF_REPLACE") == "true"
-	pdfCopyMetadata        = os.Getenv("PDF_COPY_METADATA") == "true"
-	pdfOCRCompleteTag      = os.Getenv("PDF_OCR_COMPLETE_TAG")
-	pdfOCRTagging          = os.Getenv("PDF_OCR_TAGGING") == "true"
-	pdfSkipExistingOCR     = os.Getenv("PDF_SKIP_EXISTING_OCR") == "true"
-	doclingURL             = os.Getenv("DOCLING_URL")
-	doclingImageExportMode = os.Getenv("DOCLING_IMAGE_EXPORT_MODE")
-	doclingOCRPipeline     = os.Getenv("DOCLING_OCR_PIPELINE")
-	doclingOCREngine       = os.Getenv("DOCLING_OCR_ENGINE")
-	googleThinkingBudget   *int32 // Will be parsed from GOOGLEAI_THINKING_BUDGET
+	createNewDocumentType    = os.Getenv("CREATE_NEW_DOCUMENT_TYPE") == "true"
+	preserveExistingMetadata = os.Getenv("PRESERVE_EXISTING_METADATA") == "true"
+	limitOcrPages            int // Will be read from OCR_LIMIT_PAGES
+	ocrMaxRetries            int // Will be read from OCR_MAX_RETRIES
+	autoTagMaxRetries        int // Will be read from AUTO_TAG_MAX_RETRIES
+	tokenLimit               = 0 // Will be read from TOKEN_LIMIT
+	imageMaxPixelDimension   int // Will be read from IMAGE_MAX_PIXEL_DIMENSION
+	imageMaxTotalPixels      int // Will be read from IMAGE_MAX_TOTAL_PIXELS
+	imageMaxRenderDPI        int // Will be read from IMAGE_MAX_RENDER_DPI
+	imageMaxFileBytes        int // Will be read from IMAGE_MAX_FILE_BYTES
+	createLocalHOCR          = os.Getenv("CREATE_LOCAL_HOCR") == "true"
+	createLocalPDF           = os.Getenv("CREATE_LOCAL_PDF") == "true"
+	localHOCRPath            = os.Getenv("LOCAL_HOCR_PATH")
+	localPDFPath             = os.Getenv("LOCAL_PDF_PATH")
+	pdfUpload                = os.Getenv("PDF_UPLOAD") == "true"
+	pdfUploadMode            = strings.ToLower(strings.TrimSpace(os.Getenv("PDF_UPLOAD_MODE")))
+	pdfReplace               = os.Getenv("PDF_REPLACE") == "true"
+	pdfCopyMetadata          = os.Getenv("PDF_COPY_METADATA") == "true"
+	pdfOCRCompleteTag        = os.Getenv("PDF_OCR_COMPLETE_TAG")
+	pdfOCRTagging            = os.Getenv("PDF_OCR_TAGGING") == "true"
+	pdfSkipExistingOCR       = os.Getenv("PDF_SKIP_EXISTING_OCR") == "true"
+	doclingURL               = os.Getenv("DOCLING_URL")
+	doclingImageExportMode   = os.Getenv("DOCLING_IMAGE_EXPORT_MODE")
+	doclingOCRPipeline       = os.Getenv("DOCLING_OCR_PIPELINE")
+	doclingOCREngine         = os.Getenv("DOCLING_OCR_ENGINE")
+	doclingOutputFormat      = os.Getenv("DOCLING_OUTPUT_FORMAT")
+	googleThinkingBudget     *int32 // Will be parsed from GOOGLEAI_THINKING_BUDGET
 
 	// Templates
 	titleTemplate         *template.Template
@@ -111,10 +120,15 @@ var (
 	customFieldsCacheMu sync.RWMutex
 )
 
+// startupCallTimeout bounds each paperless-ngx call made during startup, so
+// the HTTP server comes up even when paperless-ngx is slow or unreachable;
+// the background workers retry later.
+const startupCallTimeout = 30 * time.Second
+
 // refreshCustomFieldsCache fetches custom fields from Paperless and updates the cache.
-func refreshCustomFieldsCache(client ClientInterface) {
+func refreshCustomFieldsCache(ctx context.Context, client ClientInterface) {
 	log.Info("Refreshing custom fields cache...")
-	fields, err := client.GetCustomFields(context.Background())
+	fields, err := client.GetCustomFields(ctx)
 	if err != nil {
 		log.Errorf("Error refreshing custom fields cache: %v", err)
 		return
@@ -131,20 +145,25 @@ type App struct {
 	Database           *gorm.DB
 	LLM                llms.Model
 	VisionLLM          llms.Model
-	ocrProvider        ocr.Provider      // OCR provider interface
-	ocrProcessMode     string            // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
-	docProcessor       DocumentProcessor // Optional: Can be used for mocking
-	localHOCRPath      string            // Path for saving hOCR files locally
-	localPDFPath       string            // Path for saving PDF files locally
-	createLocalHOCR    bool              // Whether to save hOCR files locally
-	createLocalPDF     bool              // Whether to create PDF files locally
-	pdfUpload          bool              // Whether to upload processed PDFs to paperless-ngx
-	pdfReplace         bool              // Whether to replace original document after upload
-	pdfCopyMetadata    bool              // Whether to copy metadata from original to uploaded PDF
-	pdfOCRCompleteTag  string            // Tag to add to documents that have been OCR processed
-	pdfOCRTagging      bool              // Whether to add the OCR complete tag to processed PDFs
-	pdfSkipExistingOCR bool              // Whether to skip processing PDFs that already have OCR detected
-	autoTagComplete    string            // Tag to add to documents after auto-processing is complete
+	ocrProvider        ocr.Provider           // OCR provider interface
+	ocrProcessMode     string                 // OCR processing mode: "image" (default), "pdf" or "whole_pdf"
+	docProcessor       DocumentProcessor      // Optional: Can be used for mocking
+	localHOCRPath      string                 // Path for saving hOCR files locally
+	localPDFPath       string                 // Path for saving PDF files locally
+	createLocalHOCR    bool                   // Whether to save hOCR files locally
+	createLocalPDF     bool                   // Whether to create PDF files locally
+	pdfUpload          bool                   // Whether to upload processed PDFs to paperless-ngx
+	pdfUploadMode      string                 // PDFUploadModeNew or PDFUploadModeVersion
+	pdfReplace         bool                   // Whether to replace original document after upload
+	pdfCopyMetadata    bool                   // Whether to copy metadata from original to uploaded PDF
+	pdfOCRCompleteTag  string                 // Tag to add to documents that have been OCR processed
+	pdfOCRTagging      bool                   // Whether to add the OCR complete tag to processed PDFs
+	pdfSkipExistingOCR bool                   // Whether to skip processing PDFs that already have OCR detected
+	autoTagComplete    string                 // Tag to add to documents after auto-processing is complete
+	ocrProviderLabel   string                 // Human-readable provider description for run records ("llm (ollama/minicpm-v)")
+	ocrFailures        documentFailureTracker // Per-document OCR failure counts for the auto-OCR poll
+	suggestionFailures documentFailureTracker // Per-document suggestion failure counts for the auto-tag poll
+	WorkflowRouter     WorkflowRouter         // Maps documents to workflows; nil uses one trigger tag per workflow
 }
 
 func main() {
@@ -165,10 +184,16 @@ func main() {
 
 	// Load settings from file
 	loadSettings()
+	persistence := checkPersistence()
+	logPersistenceIssues(persistence)
+	migrateWorkflowsFromSettings(workflows)
 
 	if settings.CustomFieldsEnable && len(settings.CustomFieldsSelectedIDs) == 0 {
 		log.Warn("Custom fields are enabled, but no custom fields are selected in the settings.")
 	}
+
+	// UI-saved OCR defaults shadow env values; say so where operators look.
+	logOCRSettingsOverrides()
 
 	// Print version
 	printVersion()
@@ -176,17 +201,63 @@ func main() {
 	// Initialize PaperlessClient
 	client := NewPaperlessClient(paperlessBaseURL, paperlessAPIToken)
 
+	// Bound startup metadata calls so the HTTP server can still come up when
+	// Paperless-ngx is temporarily unavailable. Background workers retry later.
+	// Each call gets its own deadline, so a slow call cannot use up the time
+	// of the ones after it.
+	var startupCancels []context.CancelFunc
+	defer func() {
+		for _, cancel := range startupCancels {
+			cancel()
+		}
+	}()
+	startupCtx := func() context.Context {
+		callCtx, cancel := context.WithTimeout(ctx, startupCallTimeout)
+		startupCancels = append(startupCancels, cancel)
+		return callCtx
+	}
+
 	// Ensure the fail tag exists in paperless-ngx. paperless-gpt applies this
 	// tag mechanically when document processing fails (see processAutoTagDocuments),
 	// so it must be available regardless of the CREATE_NEW_TAGS setting.
 	// A failure here is logged but non-fatal: the loop-break path still removes
 	// the auto tag, the fail tag is just not applied.
-	if err := client.EnsureTagExists(ctx, failTag); err != nil {
+	if err := client.EnsureTagExists(startupCtx(), failTag); err != nil {
 		log.Warnf("Failed to ensure fail tag %q exists: %v. Recovery from a failed document update will still remove the auto tag (loop break works), but the fail tag will not be added.", failTag, err)
 	}
 
+	// Same for the auto-processing completion tag. It is applied mechanically
+	// once auto-processing succeeds, and the tag update silently drops names
+	// that do not exist in paperless-ngx unless CREATE_NEW_TAGS is on — so
+	// without this, users who never created the tag by hand see the trigger
+	// tag disappear and no completion tag appear.
+	if autoTagComplete != "" {
+		if err := client.EnsureTagExists(startupCtx(), autoTagComplete); err != nil {
+			log.Warnf("Failed to ensure auto tag complete %q exists: %v. Auto-processing will still work, but documents will not be marked as complete.", autoTagComplete, err)
+		}
+	}
+
+	// And the OCR completion tag, for the same reason. Beyond marking the
+	// document, this tag is what the skip check in ProcessDocumentOCR reads to
+	// recognise an already-processed document, and what users trigger their own
+	// paperless-ngx workflows on — so silently dropping it breaks more than a
+	// label.
+	if pdfOCRTagging && pdfOCRCompleteTag != "" {
+		if err := client.EnsureTagExists(startupCtx(), pdfOCRCompleteTag); err != nil {
+			log.Warnf("Failed to ensure OCR complete tag %q exists: %v. OCR will still run, but documents will not be marked as OCR-processed.", pdfOCRCompleteTag, err)
+		}
+	}
+
+	ensureWorkflowTagsExist(startupCtx(), client.EnsureTagExists)
+	// Workflows added or changed by editing their files get their tags too.
+	workflows.OnChange(func([]WorkflowConfig) {
+		ensureCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		ensureWorkflowTagsExist(ensureCtx, client.EnsureTagExists)
+	})
+
 	// Initial fetch of custom fields
-	refreshCustomFieldsCache(client)
+	refreshCustomFieldsCache(startupCtx(), client)
 
 	// Start a goroutine to refresh the cache every hour
 	go func() {
@@ -197,13 +268,16 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				refreshCustomFieldsCache(client)
+				refreshCustomFieldsCache(ctx, client)
 			}
 		}
 	}()
 
 	// Initialize Database
 	database := InitializeDB()
+	if err := MarkInterruptedOCRRuns(database); err != nil {
+		log.Warnf("Failed to mark interrupted OCR runs: %v", err)
+	}
 
 	// Load Templates
 	if err := loadTemplates(); err != nil {
@@ -278,6 +352,32 @@ func main() {
 		}
 	}
 
+	var mistralImageLimit *int
+	if limitStr := os.Getenv("MISTRAL_OCR_IMAGE_LIMIT"); limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil {
+			if parsed >= 0 {
+				mistralImageLimit = &parsed
+			} else {
+				log.Warnf("Invalid MISTRAL_OCR_IMAGE_LIMIT value: must be >= 0, got %d, ignoring", parsed)
+			}
+		} else {
+			log.Warnf("Invalid MISTRAL_OCR_IMAGE_LIMIT value: %v, ignoring", err)
+		}
+	}
+
+	var mistralImageMinSize *int
+	if minSizeStr := os.Getenv("MISTRAL_OCR_IMAGE_MIN_SIZE"); minSizeStr != "" {
+		if parsed, err := strconv.Atoi(minSizeStr); err == nil {
+			if parsed >= 0 {
+				mistralImageMinSize = &parsed
+			} else {
+				log.Warnf("Invalid MISTRAL_OCR_IMAGE_MIN_SIZE value: must be >= 0, got %d, ignoring", parsed)
+			}
+		} else {
+			log.Warnf("Invalid MISTRAL_OCR_IMAGE_MIN_SIZE value: %v, ignoring", err)
+		}
+	}
+
 	if val, ok := os.LookupEnv("GOOGLEAI_THINKING_BUDGET"); ok {
 		if v, err := strconv.ParseInt(val, 10, 32); err == nil {
 			if v >= math.MinInt32 && v <= math.MaxInt32 {
@@ -303,10 +403,13 @@ func main() {
 		AzureOutputContentFormat: AzureDocAIOutputContentFormat,
 		MistralAPIKey:            os.Getenv("MISTRAL_API_KEY"),
 		MistralModel:             os.Getenv("MISTRAL_MODEL"),
+		MistralImageLimit:        mistralImageLimit,
+		MistralImageMinSize:      mistralImageMinSize,
 		DoclingURL:               doclingURL,
 		DoclingImageExportMode:   doclingImageExportMode,
 		DoclingOCRPipeline:       doclingOCRPipeline,
 		DoclingOCREngine:         doclingOCREngine,
+		DoclingOutputFormat:      doclingOutputFormat,
 		EnableHOCR:               true, // Always generate hOCR struct if provider supports it
 		VisionLLMMaxTokens:       visionLlmMaxTokens,
 		VisionLLMTemperature:     visionLlmTemperature,
@@ -356,16 +459,28 @@ func main() {
 		createLocalHOCR:    createLocalHOCR,
 		createLocalPDF:     createLocalPDF,
 		pdfUpload:          pdfUpload,
+		pdfUploadMode:      pdfUploadMode,
 		pdfReplace:         pdfReplace,
 		pdfCopyMetadata:    pdfCopyMetadata,
 		pdfOCRCompleteTag:  pdfOCRCompleteTag,
 		pdfOCRTagging:      pdfOCRTagging,
 		pdfSkipExistingOCR: pdfSkipExistingOCR,
 		autoTagComplete:    autoTagComplete,
+		ocrProviderLabel:   ocrProviderLabel(),
+	}
+
+	rawAutoTagMaxRetries := os.Getenv("AUTO_TAG_MAX_RETRIES")
+	if rawAutoTagMaxRetries == "" {
+		autoTagMaxRetries = 3
+	} else {
+		var err error
+		autoTagMaxRetries, err = strconv.Atoi(rawAutoTagMaxRetries)
+		if err != nil || autoTagMaxRetries < 0 {
+			log.Fatalf("Invalid AUTO_TAG_MAX_RETRIES value: %q (must be a non-negative integer, 0 disables the limit)", rawAutoTagMaxRetries)
+		}
 	}
 
 	if app.isOcrEnabled() {
-		fmt.Printf("Using %s as manual OCR tag\n", manualOcrTag)
 		fmt.Printf("Using %s as auto OCR tag\n", autoOcrTag)
 		rawLimitOcrPages := os.Getenv("OCR_LIMIT_PAGES")
 		if rawLimitOcrPages == "" {
@@ -377,6 +492,29 @@ func main() {
 				log.Fatalf("Invalid OCR_LIMIT_PAGES value: %v", err)
 			}
 		}
+		rawOcrMaxRetries := os.Getenv("OCR_MAX_RETRIES")
+		if rawOcrMaxRetries == "" {
+			ocrMaxRetries = 3
+		} else {
+			var err error
+			ocrMaxRetries, err = strconv.Atoi(rawOcrMaxRetries)
+			if err != nil || ocrMaxRetries < 0 {
+				log.Fatalf("Invalid OCR_MAX_RETRIES value: %q (must be a non-negative integer, 0 disables the limit)", rawOcrMaxRetries)
+			}
+		}
+
+		// Compile the PDF renderer in the background so the first OCR run or
+		// page preview after a restart doesn't pay for it. Not started when
+		// OCR is disabled: nothing renders PDFs then, and it would only cost
+		// CPU at startup and memory for the compiled module.
+		go func() {
+			start := time.Now()
+			if err := pdfrender.Warm(); err != nil {
+				log.Errorf("Preparing the PDF renderer failed: %v. PDF rendering stays unavailable until paperless-gpt is restarted.", err)
+				return
+			}
+			log.Infof("PDF renderer ready after %v", time.Since(start).Round(time.Millisecond))
+		}()
 	}
 
 	// Start Background-Tasks for Auto-Tagging and Auto-OCR (if enabled)
@@ -391,8 +529,15 @@ func main() {
 		api.GET("/documents", app.documentsHandler)
 		// http://localhost:8080/api/documents/544
 		api.GET("/documents/:id", app.getDocumentHandler())
+		api.GET("/documents/:id/thumb", app.getDocumentThumbnailHandler)
 		api.POST("/generate-suggestions", app.generateSuggestionsHandler)
+		api.POST("/jobs/suggestions", app.submitSuggestionJobHandler)
+		api.GET("/jobs/suggestions/:job_id", app.getSuggestionJobStatusHandler)
+		api.GET("/jobs/suggestions", app.getAllSuggestionJobsHandler)
+		api.POST("/jobs/suggestions/:job_id/stop", app.stopSuggestionJobHandler)
 		api.PATCH("/update-documents", app.updateDocumentsHandler)
+		api.GET("/reviews", app.listPendingReviewsHandler)
+		api.POST("/reviews/:id/discard", app.discardPendingReviewHandler)
 		api.GET("/filter-tag", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"tag": manualTag})
 		})
@@ -411,6 +556,13 @@ func main() {
 		api.DELETE("/documents/:id/ocr_pages/:pageIndex/reocr", app.cancelReOCRPageHandler)
 		api.GET("/jobs/ocr/:job_id", app.getJobStatusHandler)
 		api.GET("/jobs/ocr", app.getAllJobsHandler)
+		api.GET("/ocr/runs", app.listOCRRunsHandler)
+		api.GET("/ocr/config", app.getOCRConfigHandler)
+		api.GET("/config", app.getConfigHandler)
+		api.PUT("/ocr/defaults", app.updateOCRDefaultsHandler)
+		api.DELETE("/ocr/defaults", app.resetOCRDefaultsHandler)
+		api.GET("/search-documents", app.searchDocumentsHandler)
+		api.GET("/documents/:id/pages/:pageIndex/image", app.getDocumentPageImageHandler)
 		api.POST("/ocr/jobs/:job_id/stop", app.stopOCRJobHandler)
 
 		// Endpoint to see if user enabled OCR
@@ -436,6 +588,16 @@ func main() {
 
 		// Get version information
 		api.GET("/version", getVersionHandler)
+
+		// Workflows
+		api.GET("/workflows", app.listWorkflowsHandler)
+		api.POST("/workflows", app.createWorkflowHandler)
+		api.GET("/workflows/defaults", app.workflowDefaultsHandler)
+		api.GET("/persistence", persistenceHandler(persistence))
+		api.POST("/workflows/preview", app.workflowPreviewHandler)
+		api.PUT("/workflows/:id", app.updateWorkflowHandler)
+		api.DELETE("/workflows/:id", app.deleteWorkflowHandler)
+		api.GET("/workflows/:id/documents", app.workflowDocumentsHandler)
 	}
 
 	// Serve frontend files
@@ -452,10 +614,16 @@ func main() {
 		router.GET("/experimental-ocr", func(c *gin.Context) {
 			c.File("web-app/dist/index.html")
 		})
+		router.GET("/ocr", func(c *gin.Context) {
+			c.File("web-app/dist/index.html")
+		})
 		router.GET("/settings", func(c *gin.Context) {
 			c.File("web-app/dist/index.html")
 		})
 		router.GET("/adhoc-analysis", func(c *gin.Context) {
+			c.File("web-app/dist/index.html")
+		})
+		router.GET("/workflows", func(c *gin.Context) {
 			c.File("web-app/dist/index.html")
 		})
 		router.GET("/favicon.ico", func(c *gin.Context) {
@@ -483,6 +651,11 @@ func main() {
 		router.GET("/experimental-ocr", func(c *gin.Context) {
 			serveEmbeddedFile(c, "", "index.html")
 		})
+		// ocr route (tabs use a query param; nested paths would break the
+		// relative asset base needed for reverse-proxy prefixes)
+		router.GET("/ocr", func(c *gin.Context) {
+			serveEmbeddedFile(c, "", "index.html")
+		})
 		// settings route
 		router.GET("/settings", func(c *gin.Context) {
 			serveEmbeddedFile(c, "", "index.html")
@@ -491,11 +664,16 @@ func main() {
 		router.GET("/adhoc-analysis", func(c *gin.Context) {
 			serveEmbeddedFile(c, "", "index.html")
 		})
+		// workflows route
+		router.GET("/workflows", func(c *gin.Context) {
+			serveEmbeddedFile(c, "", "index.html")
+		})
 	}
 
 	// Start OCR worker pool
 	numWorkers := 1 // Number of workers to start
 	startWorkerPool(app, numWorkers)
+	startSuggestionWorkerPool(app, suggestionWorkerCount())
 
 	if listenInterface == "" {
 		listenInterface = ":8080"
@@ -546,6 +724,9 @@ func initLogger() {
 		}
 	}
 
+	// The OCR package has its own logger; keep it in sync with LOG_LEVEL.
+	ocr.SetLogLevel(log.GetLevel())
+
 	log.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp: true,
 	})
@@ -553,6 +734,33 @@ func initLogger() {
 
 func (app *App) isOcrEnabled() bool {
 	return app.ocrProvider != nil
+}
+
+// ocrProviderLabel composes a human-readable description of the configured
+// OCR provider for run records and the config endpoint.
+func ocrProviderLabel() string {
+	provider := os.Getenv("OCR_PROVIDER")
+	if provider == "" {
+		provider = "llm"
+	}
+	switch provider {
+	case "llm":
+		if visionLlmProvider != "" {
+			if visionLlmModel != "" {
+				return fmt.Sprintf("llm (%s/%s)", visionLlmProvider, visionLlmModel)
+			}
+			return fmt.Sprintf("llm (%s)", visionLlmProvider)
+		}
+		return "llm"
+	case "mistral_ocr":
+		model := os.Getenv("MISTRAL_MODEL")
+		if model == "" {
+			model = "mistral-ocr-latest"
+		}
+		return fmt.Sprintf("mistral_ocr (%s)", model)
+	default:
+		return provider
+	}
 }
 
 // validateOCRProviderModeCompatibility validates that the OCR provider supports the specified processing mode
@@ -600,10 +808,6 @@ func validateOrDefaultEnvVars() {
 	}
 	fmt.Printf("Using %s as auto tag\n", autoTag)
 
-	if manualOcrTag == "" {
-		manualOcrTag = "paperless-gpt-ocr"
-	}
-
 	if autoOcrTag == "" {
 		autoOcrTag = "paperless-gpt-ocr-auto"
 	}
@@ -635,6 +839,17 @@ func validateOrDefaultEnvVars() {
 			}
 		}
 		fmt.Printf("Will remove %v after a complete auto-processing run\n", autoRemoveTags)
+	}
+
+	rawCorrespondentPromptLimit := os.Getenv("CORRESPONDENT_PROMPT_LIMIT")
+	if rawCorrespondentPromptLimit == "" {
+		correspondentPromptLimit = 0
+	} else {
+		var err error
+		correspondentPromptLimit, err = strconv.Atoi(rawCorrespondentPromptLimit)
+		if err != nil || correspondentPromptLimit < 0 {
+			log.Fatalf("Invalid CORRESPONDENT_PROMPT_LIMIT value: %q (must be a non-negative integer, 0 sends the full list)", rawCorrespondentPromptLimit)
+		}
 	}
 
 	if paperlessBaseURL == "" {
@@ -714,6 +929,19 @@ func validateOrDefaultEnvVars() {
 				log.Fatal("Please set the OPENAI_BASE_URL environment variable for Azure OpenAI.")
 			}
 		}
+	}
+
+	switch pdfUploadMode {
+	case "":
+		pdfUploadMode = PDFUploadModeNew
+	case PDFUploadModeNew, PDFUploadModeVersion:
+	default:
+		// No silent fallback: "new" would add a duplicate document for every PDF.
+		log.Fatalf("Invalid PDF_UPLOAD_MODE value: %q (must be %q or %q)", pdfUploadMode, PDFUploadModeNew, PDFUploadModeVersion)
+	}
+	if pdfUploadMode == PDFUploadModeVersion && pdfReplace {
+		log.Warnf("PDF_REPLACE is ignored when PDF_UPLOAD_MODE=%s: versions never delete anything", PDFUploadModeVersion)
+		pdfReplace = false
 	}
 
 	if ocrProcessMode == "" {
@@ -814,7 +1042,11 @@ func validateOrDefaultEnvVars() {
 		}
 	}
 	if pdfUpload {
-		log.Infof("PDF upload to paperless-ngx is enabled")
+		if pdfUploadMode == PDFUploadModeVersion {
+			log.Infof("PDF upload to paperless-ngx is enabled: searchable PDFs are added as new versions of the same document")
+		} else {
+			log.Infof("PDF upload to paperless-ngx is enabled")
+		}
 		if pdfReplace {
 			log.Infof("Original documents will be replaced after OCR upload")
 		}
@@ -841,6 +1073,65 @@ func removeTagFromList(tags []string, tagToRemove string) []string {
 		}
 	}
 	return filteredTags
+}
+
+// systemTags returns every tag paperless-gpt manages itself: the triggers it
+// watches for and the markers it writes, including per-workflow trigger and
+// completion tags. None of them describe a document, so none of them belong
+// in a suggestion prompt.
+//
+// Configured-empty tags are skipped, because "" would otherwise match nothing
+// useful and only obscures intent.
+func systemTags() []string {
+	configured := []string{
+		manualTag,
+		autoTag,
+		autoOcrTag,
+		failTag,
+		autoTagComplete,
+		pdfOCRCompleteTag,
+	}
+	configured = append(configured, workflowManagedTags()...)
+	seen := make(map[string]bool, len(configured))
+	tags := make([]string, 0, len(configured))
+	for _, tag := range configured {
+		key := strings.ToLower(tag)
+		if tag == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		tags = append(tags, tag)
+	}
+	return tags
+}
+
+// removeSystemTags strips paperless-gpt's own tags from a list of tag names
+// before it reaches the LLM.
+//
+// Leaving any of them in has consequences beyond a cosmetically wrong
+// suggestion: the LLM offers the tag, paperless-gpt applies it, and the
+// document re-enters a processing queue. With a paperless-ngx workflow
+// chaining OCR to tagging, suggesting the OCR-complete tag produces an
+// unbounded loop that re-bills every LLM call on each pass (#877), and
+// suggesting the fail or completion tag makes a document lie about its own
+// state (#1015).
+//
+// Matching is case-insensitive: paperless-ngx tag names are case-preserving
+// but users routinely configure a different case than the tag actually has,
+// and a near-miss here reopens the loop.
+func removeSystemTags(tags []string) []string {
+	excluded := make(map[string]bool)
+	for _, tag := range systemTags() {
+		excluded[strings.ToLower(tag)] = true
+	}
+
+	filtered := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if !excluded[strings.ToLower(tag)] {
+			filtered = append(filtered, tag)
+		}
+	}
+	return filtered
 }
 
 // getLikelyLanguage determines the likely language of the document content
@@ -890,6 +1181,20 @@ func loadTemplates() error {
 		content, err := os.ReadFile(promptPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read prompt '%s': %w", name, err)
+		}
+
+		// A prompt that is still an earlier default was never customised:
+		// give it the current default, so fixes to the default prompts reach
+		// existing installations too.
+		if isPreviousDefaultPrompt(name, content) {
+			if defaultContent, err := os.ReadFile(defaultPromptPath); err == nil && !bytes.Equal(defaultContent, content) {
+				if err := os.WriteFile(promptPath, defaultContent, 0644); err != nil {
+					log.Warnf("Prompt '%s' is an outdated default but could not be updated: %v", name, err)
+				} else {
+					log.Infof("Prompt '%s' was an unchanged earlier default; updated it to the current default", name)
+					content = defaultContent
+				}
+			}
 		}
 
 		// Parse and return the template
@@ -982,6 +1287,17 @@ func getRateLimitConfig(isVision bool) RateLimitConfig {
 
 // createLLM creates the appropriate LLM client based on the provider
 func createLLM() (llms.Model, error) {
+	if strings.ToLower(llmProvider) != "ollama" {
+		if temperature := os.Getenv("LLM_TEMPERATURE"); temperature != "" {
+			log.Warn("LLM_TEMPERATURE only applies when LLM_PROVIDER=ollama; ignoring")
+		}
+		for _, name := range []string{"LLM_MAX_TOKENS", "OLLAMA_KEEP_ALIVE", "OLLAMA_THINK"} {
+			if value := os.Getenv(name); value != "" {
+				log.Warnf("%s only applies when LLM_PROVIDER=ollama; ignoring", name)
+			}
+		}
+	}
+
 	switch strings.ToLower(llmProvider) {
 	case "mistral":
 		mistralApiKey := os.Getenv("MISTRAL_API_KEY")
@@ -1037,31 +1353,9 @@ func createLLM() (llms.Model, error) {
 		if host == "" {
 			host = "http://127.0.0.1:11434"
 		}
-		opts := []ollama.Option{
-			ollama.WithModel(llmModel),
-			ollama.WithServerURL(host),
-		}
-		if ctxLenStr := os.Getenv("OLLAMA_CONTEXT_LENGTH"); ctxLenStr != "" {
-			if parsed, err := strconv.Atoi(ctxLenStr); err == nil && parsed > 0 {
-				opts = append(opts, ollama.WithRunnerNumCtx(parsed))
-			} else if err != nil {
-				log.Warnf("Invalid OLLAMA_CONTEXT_LENGTH value: %v, ignoring", err)
-			}
-		}
-		if thinkStr := os.Getenv("OLLAMA_THINK"); thinkStr != "" {
-			// Allow disabling Ollama reasoning mode for tasks where format
-			// compliance matters more than chain-of-thought (closed-list
-			// classification, strict JSON). Unset = upstream default behavior.
-			if parsed, err := strconv.ParseBool(thinkStr); err == nil {
-				opts = append(opts, ollama.WithThink(parsed))
-			} else {
-				log.Warnf("Invalid OLLAMA_THINK value: %v, ignoring (must be true/false)", err)
-			}
-		}
-		if client := ocr.OllamaHTTPClient(); client != nil {
-			opts = append(opts, ollama.WithHTTPClient(client))
-		}
-		llm, err := ollama.New(opts...)
+		var config OllamaMetadataConfig
+		applyOllamaMetadataEnvironment(&config)
+		llm, err := newOllamaMetadataModel(host, llmModel, 0, nil, 0, ollamaHTTPClientWithTimeout(), config)
 		if err != nil {
 			return nil, err
 		}
@@ -1084,7 +1378,12 @@ func createLLM() (llms.Model, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create GoogleAI provider: %w", err)
 		}
-		return provider, nil
+
+		// Apply rate limiting with isVision=false. The Google AI client has
+		// no limiter of its own, so this is what makes
+		// LLM_REQUESTS_PER_MINUTE and LLM_MAX_RETRIES apply to suggestion
+		// calls.
+		return NewRateLimitedLLM(provider, getRateLimitConfig(false)), nil
 	case "anthropic":
 		apiKey := os.Getenv("ANTHROPIC_API_KEY")
 		if apiKey == "" {
@@ -1173,7 +1472,7 @@ func createVisionLLM() (llms.Model, error) {
 				log.Warnf("Invalid OLLAMA_CONTEXT_LENGTH value: %v, ignoring", err)
 			}
 		}
-		if client := ocr.OllamaHTTPClient(); client != nil {
+		if client := ollamaHTTPClientWithTimeout(); client != nil {
 			opts = append(opts, ollama.WithHTTPClient(client))
 		}
 		llm, err := ollama.New(opts...)
@@ -1213,32 +1512,49 @@ func createVisionLLM() (llms.Model, error) {
 }
 
 func createCustomHTTPClient() *http.Client {
-	// Create custom transport that adds headers
-	customTransport := &headerTransport{
-		transport: http.DefaultTransport,
-		headers: map[string]string{
-			"X-Title": "paperless-gpt",
-		},
-	}
-
-	// Create custom client with the transport
-	httpClient := http.DefaultClient
-	httpClient.Transport = customTransport
-
-	return httpClient
+	return ocr.OpenAIHTTPClient()
 }
 
-// headerTransport is a custom http.RoundTripper that adds custom headers to requests
-type headerTransport struct {
-	transport http.RoundTripper
-	headers   map[string]string
+// ollamaRequestTimeout returns the per-request timeout for Ollama HTTP calls.
+// Configurable via OLLAMA_TIMEOUT_SECONDS; defaults to 300s. A value <= 0
+// disables the timeout (restoring the previous unbounded behavior).
+func ollamaRequestTimeout() time.Duration {
+	if raw := os.Getenv("OLLAMA_TIMEOUT_SECONDS"); raw != "" {
+		if secs, err := strconv.Atoi(raw); err == nil {
+			if secs <= 0 {
+				return 0
+			}
+			return time.Duration(secs) * time.Second
+		}
+		log.Warnf("Invalid OLLAMA_TIMEOUT_SECONDS value: %q, using default 300s", raw)
+	}
+	return 300 * time.Second
 }
 
-// RoundTrip implements the http.RoundTripper interface
-func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	for key, value := range t.headers {
-		req.Header.Set(key, value)
+// ollamaHTTPClientWithTimeout wraps the optional header-injecting client from
+// ocr.OllamaHTTPClient() so that Ollama requests always carry a request
+// timeout. Without it both Ollama paths end up on a timeout-less client —
+// http.DefaultClient for the metadata model, langchaingo's default for the
+// vision provider — and a single stalled generation freezes the whole
+// background loop indefinitely, recoverable only by restarting the container.
+// Returns nil only when the timeout is explicitly disabled AND no custom header
+// client is configured, preserving the previous behavior for both.
+func ollamaHTTPClientWithTimeout() *http.Client {
+	timeout := ollamaRequestTimeout()
+	base := ocr.OllamaHTTPClient() // may be nil when OLLAMA_HEADERS is unset
+	if base == nil {
+		if timeout == 0 {
+			return nil
+		}
+		return &http.Client{Timeout: timeout}
 	}
-	return t.transport.RoundTrip(req)
+	base.Timeout = timeout
+	return base
+}
+
+// isPreviousDefaultPrompt reports whether content is an earlier version of the
+// default prompt called name.
+func isPreviousDefaultPrompt(name string, content []byte) bool {
+	sum := sha256.Sum256(content)
+	return slices.Contains(previousDefaultPrompts[name], hex.EncodeToString(sum[:]))
 }

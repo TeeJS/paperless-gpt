@@ -37,10 +37,18 @@ func (m *mockOCRProvider) ProcessImage(ctx context.Context, imageData []byte, pa
 
 // mockDocumentProcessor implements the DocumentProcessor interface for testing
 type mockDocumentProcessor struct {
-	mockText string
+	mockText  string
+	mockErr   error         // returned for every document while non-nil
+	perDocErr map[int]error // returned for specific documents while set
 }
 
 func (m *mockDocumentProcessor) ProcessDocumentOCR(ctx context.Context, documentID int, options OCROptions, jobID string) (*ProcessedDocument, error) {
+	if err := m.perDocErr[documentID]; err != nil {
+		return nil, err
+	}
+	if m.mockErr != nil {
+		return nil, m.mockErr
+	}
 	return &ProcessedDocument{
 		ID:   documentID,
 		Text: m.mockText,
@@ -79,6 +87,10 @@ func (m *mockClient) GetDocument(ctx context.Context, documentID int) (Document,
 		return doc, nil
 	}
 	return Document{}, fmt.Errorf("document %d not found", documentID)
+}
+
+func (m *mockClient) GetDocumentThumbnail(ctx context.Context, documentID int) ([]byte, string, error) {
+	return nil, "", fmt.Errorf("not implemented")
 }
 
 func (m *mockClient) AddDocument(doc Document, tags []string) {
@@ -543,12 +555,15 @@ func TestProcessAutoOcrTagDocuments(t *testing.T) {
 }
 
 // recordingClient is a stub ClientInterface used to verify the loop-break
-// recovery PATCH built by recoverFromFailedUpdate.
+// recovery PATCH built by recoverFromFailedUpdate / markProcessingFailed.
 type recordingClient struct {
 	*PaperlessClient
 	calls           []DocumentSuggestion
-	updateErr       error // returned by UpdateDocuments while non-nil
-	failAfterNCalls int   // 0 = always succeed, N>0 = fail first N calls then succeed
+	updateErr       error                 // returned by UpdateDocuments while non-nil
+	failAfterNCalls int                   // 0 = always succeed, N>0 = fail first N calls then succeed
+	taggedDocuments map[string][]Document // served by GetDocumentsByTag
+	tagFetches      []string              // tags requested via GetDocumentsByTag, in order
+	getAllTagsErr   error                 // when set, GetAllTags fails — used to make suggestion generation fail
 }
 
 func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
@@ -560,6 +575,46 @@ func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []Docum
 		return r.updateErr
 	}
 	return nil
+}
+
+func (r *recordingClient) GetDocumentsByTag(ctx context.Context, tag string, pageSize int) ([]Document, error) {
+	r.tagFetches = append(r.tagFetches, tag)
+	return r.taggedDocuments[tag], nil
+}
+
+// GetDocument serves the same documents GetDocumentsByTag returns, so the
+// auto-tag poll can fetch full details for one it just listed.
+func (r *recordingClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
+	for _, docs := range r.taggedDocuments {
+		for _, d := range docs {
+			if d.ID == documentID {
+				return d, nil
+			}
+		}
+	}
+	return Document{}, fmt.Errorf("document %d not found", documentID)
+}
+
+func (r *recordingClient) GetCustomFields(ctx context.Context) ([]CustomField, error) {
+	return nil, nil
+}
+
+func (r *recordingClient) GetAllTags(ctx context.Context) (map[string]int, error) {
+	if r.getAllTagsErr != nil {
+		return nil, r.getAllTagsErr
+	}
+	return map[string]int{}, nil
+}
+
+// callsFor filters the recorded UpdateDocuments suggestions by document ID.
+func (r *recordingClient) callsFor(documentID int) []DocumentSuggestion {
+	var out []DocumentSuggestion
+	for _, c := range r.calls {
+		if c.ID == documentID {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // TestRecoverFromFailedUpdate verifies that the recovery PATCH built by
@@ -619,4 +674,359 @@ func TestRecoverFromFailedUpdate(t *testing.T) {
 		require.Len(t, client.calls, 1)
 		assert.Equal(t, []string{"paperless-gpt-ocr-auto"}, client.calls[0].RemoveTags)
 	})
+}
+
+// TestProcessAutoOcrTagDocuments_FailTagAfterMaxRetries verifies that a
+// document whose OCR processing keeps failing is retried up to ocrMaxRetries
+// times and then taken out of the queue: the auto-OCR tag is removed and the
+// fail tag applied, so the poll loop stops re-paying the OCR provider for a
+// document that will never succeed.
+func TestProcessAutoOcrTagDocuments_FailTagAfterMaxRetries(t *testing.T) {
+	prevFailTag := failTag
+	prevAutoOcrTag := autoOcrTag
+	prevMaxRetries := ocrMaxRetries
+	t.Cleanup(func() {
+		failTag = prevFailTag
+		autoOcrTag = prevAutoOcrTag
+		ocrMaxRetries = prevMaxRetries
+	})
+	failTag = "paperless-gpt-failed"
+	autoOcrTag = "paperless-gpt-ocr-auto"
+
+	newDoc := func(id int) Document {
+		return Document{ID: id, Title: "Broken Doc", Tags: []string{autoOcrTag}}
+	}
+	newApp := func(client *recordingClient, processor *mockDocumentProcessor) *App {
+		// A Database is required since the auto-OCR loop now persists an OCRRun
+		// per attempt (#1005). Use a fully-migrated in-memory DB per App.
+		return &App{Client: client, docProcessor: processor, Database: newOCRRunTestDB(t)}
+	}
+
+	t.Run("fail tag applied on the configured attempt", func(t *testing.T) {
+		ocrMaxRetries = 3
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(7)}}}
+		app := newApp(client, &mockDocumentProcessor{mockErr: errors.New("pdf is broken")})
+
+		// Attempts 1 and 2: failure is counted, no PATCH, error surfaces so
+		// the loop backoff still applies.
+		for round := 1; round <= 2; round++ {
+			count, err := app.processAutoOcrTagDocuments(context.Background())
+			assert.Error(t, err, "round %d should surface the OCR error", round)
+			assert.Equal(t, 0, count)
+			assert.Empty(t, client.calls, "no tag PATCH before the limit is reached")
+		}
+
+		// Attempt 3: limit reached — trigger tag removed, fail tag added, and
+		// the handled error no longer surfaces to the loop.
+		count, err := app.processAutoOcrTagDocuments(context.Background())
+		assert.NoError(t, err, "a fail-tagged document must not keep the loop in backoff")
+		assert.Equal(t, 0, count)
+		require.Len(t, client.calls, 1, "exactly one recovery PATCH expected")
+		got := client.calls[0]
+		assert.Equal(t, 7, got.ID)
+		assert.Equal(t, []string{autoOcrTag}, got.RemoveTags, "auto OCR tag must be removed to break the loop")
+		assert.Equal(t, []string{failTag}, got.SuggestedTags, "fail tag must be added as a marker")
+		assert.True(t, got.KeepOriginalTags)
+	})
+
+	t.Run("successful OCR resets the counter", func(t *testing.T) {
+		ocrMaxRetries = 3
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(8)}}}
+		processor := &mockDocumentProcessor{mockText: "ocr text", mockErr: errors.New("flaky")}
+		app := newApp(client, processor)
+
+		// Two failures...
+		for round := 1; round <= 2; round++ {
+			_, err := app.processAutoOcrTagDocuments(context.Background())
+			assert.Error(t, err)
+		}
+		// ...then a success, which must reset the streak.
+		processor.mockErr = nil
+		count, err := app.processAutoOcrTagDocuments(context.Background())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, count)
+		require.Len(t, client.calls, 1, "only the normal OCR update expected")
+		assert.Equal(t, []string{autoOcrTag}, client.calls[0].RemoveTags)
+		assert.Empty(t, client.calls[0].SuggestedTags, "no fail tag on the success path")
+
+		// Two more failures must NOT reach the limit (streak restarted at 0).
+		processor.mockErr = errors.New("flaky again")
+		for round := 1; round <= 2; round++ {
+			_, err := app.processAutoOcrTagDocuments(context.Background())
+			assert.Error(t, err)
+		}
+		assert.Len(t, client.calls, 1, "no recovery PATCH after the counter was reset")
+	})
+
+	t.Run("failed recovery PATCH keeps the counter and is retried", func(t *testing.T) {
+		ocrMaxRetries = 3
+		client := &recordingClient{
+			taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(9)}},
+			updateErr:       errors.New("paperless unreachable"),
+			failAfterNCalls: 1,
+		}
+		app := newApp(client, &mockDocumentProcessor{mockErr: errors.New("pdf is broken")})
+
+		for round := 1; round <= 2; round++ {
+			_, err := app.processAutoOcrTagDocuments(context.Background())
+			assert.Error(t, err)
+		}
+
+		// Attempt 3: recovery PATCH fails — the error must surface and the
+		// counter must survive so the recovery is retried next round.
+		_, err := app.processAutoOcrTagDocuments(context.Background())
+		assert.Error(t, err, "failed recovery must surface the document error")
+		require.Len(t, client.calls, 1)
+
+		// Attempt 4: counter still >= limit, recovery retried and succeeds.
+		_, err = app.processAutoOcrTagDocuments(context.Background())
+		assert.NoError(t, err)
+		require.Len(t, client.calls, 2)
+		assert.Equal(t, []string{autoOcrTag}, client.calls[1].RemoveTags)
+	})
+
+	t.Run("loop shutdown is never counted", func(t *testing.T) {
+		ocrMaxRetries = 3
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(10)}}}
+		app := newApp(client, &mockDocumentProcessor{
+			mockErr: fmt.Errorf("OCR aborted: %w", context.Canceled),
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // the poll loop is shutting down
+
+		for round := 1; round <= 5; round++ {
+			_, err := app.processAutoOcrTagDocuments(ctx)
+			assert.Error(t, err)
+		}
+		assert.Empty(t, client.calls, "shutdown-caused failures must not fail-tag documents")
+	})
+
+	t.Run("provider-side timeouts do count", func(t *testing.T) {
+		ocrMaxRetries = 3
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(14)}}}
+		// Providers wrap their calls in their own timeout contexts (e.g.
+		// Azure), so a per-document timeout surfaces as an error wrapping
+		// context.DeadlineExceeded while the loop context is still alive.
+		app := newApp(client, &mockDocumentProcessor{
+			mockErr: fmt.Errorf("operation timed out after 2m0s: %w", context.DeadlineExceeded),
+		})
+
+		for round := 1; round <= 3; round++ {
+			app.processAutoOcrTagDocuments(context.Background())
+		}
+		require.Len(t, client.calls, 1, "a document that keeps timing out must be fail-tagged")
+		assert.Equal(t, []string{failTag}, client.calls[0].SuggestedTags)
+	})
+
+	t.Run("OCR_MAX_RETRIES=0 disables the limit", func(t *testing.T) {
+		ocrMaxRetries = 0
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {newDoc(11)}}}
+		app := newApp(client, &mockDocumentProcessor{mockErr: errors.New("pdf is broken")})
+
+		for round := 1; round <= 5; round++ {
+			_, err := app.processAutoOcrTagDocuments(context.Background())
+			assert.Error(t, err)
+		}
+		assert.Empty(t, client.calls, "with the limit disabled the document keeps retrying like before")
+	})
+
+	t.Run("documents are counted independently", func(t *testing.T) {
+		ocrMaxRetries = 3
+		broken, healthy := newDoc(12), newDoc(13)
+		client := &recordingClient{taggedDocuments: map[string][]Document{autoOcrTag: {broken, healthy}}}
+		app := newApp(client, &mockDocumentProcessor{
+			mockText:  "ocr text",
+			perDocErr: map[int]error{12: errors.New("pdf is broken")},
+		})
+
+		for round := 1; round <= 3; round++ {
+			app.processAutoOcrTagDocuments(context.Background())
+		}
+
+		// The healthy document is updated every round and must never reset
+		// or absorb the broken document's failure count.
+		assert.Len(t, client.callsFor(13), 3, "healthy document updated each round")
+		brokenCalls := client.callsFor(12)
+		require.Len(t, brokenCalls, 1, "broken document fail-tagged exactly once, on round 3")
+		assert.Equal(t, []string{failTag}, brokenCalls[0].SuggestedTags)
+	})
+}
+
+// TestProcessAutoTagDocuments_FailTagAfterMaxRetries covers the last failure
+// path in the auto pipeline that had no loop-break (#1071).
+//
+// When suggestion generation fails, the old code logged and `continue`d with
+// AUTO_TAG still on the document, so it was picked up again every poll cycle
+// forever. A permanently failing document (a prompt that cannot fit the model's
+// context, a model that no longer exists) therefore re-billed the same request
+// indefinitely — the reporter measured ~12,000 rejected LLM requests over seven
+// days. Worse, GetDocumentsByTag fetches one unordered page of 25, so enough
+// such documents fill that page and starve every document behind them; in that
+// report 67 documents were never processed, with the container still reporting
+// healthy.
+//
+// The failure is triggered here through the client rather than the LLM because
+// the code path under test is the same — generateDocumentSuggestions returning
+// an error — and this is the cheaper trigger to set up deterministically.
+func TestProcessAutoTagDocuments_FailTagAfterMaxRetries(t *testing.T) {
+	prevFailTag, prevAutoTag, prevMaxRetries := failTag, autoTag, autoTagMaxRetries
+	t.Cleanup(func() {
+		failTag, autoTag, autoTagMaxRetries = prevFailTag, prevAutoTag, prevMaxRetries
+	})
+	failTag = "paperless-gpt-failed"
+	autoTag = "paperless-gpt-auto"
+
+	newClient := func(id int) *recordingClient {
+		return &recordingClient{
+			taggedDocuments: map[string][]Document{autoTag: {{ID: id, Title: "Broken Doc", Tags: []string{autoTag}}}},
+			getAllTagsErr:   errors.New("exceeds the available context size"),
+		}
+	}
+
+	t.Run("fail tag applied on the configured attempt", func(t *testing.T) {
+		autoTagMaxRetries = 3
+		client := newClient(11)
+		app := &App{Client: client}
+
+		// Attempts 1 and 2: the failure is counted, nothing is written, and the
+		// error still surfaces so the loop's backoff applies.
+		for round := 1; round <= 2; round++ {
+			count, err := app.processAutoTagDocuments(context.Background())
+			assert.Error(t, err, "round %d should surface the suggestion error", round)
+			assert.Equal(t, 0, count)
+			assert.Empty(t, client.calls, "no PATCH before the limit is reached")
+		}
+
+		// Attempt 3: limit reached — trigger tag removed, fail tag applied, and
+		// the handled error no longer surfaces to the loop.
+		count, err := app.processAutoTagDocuments(context.Background())
+		assert.NoError(t, err, "a fail-tagged document must not keep the loop in backoff")
+		assert.Equal(t, 0, count)
+		require.Len(t, client.calls, 1, "exactly one recovery PATCH expected")
+		got := client.calls[0]
+		assert.Equal(t, 11, got.ID)
+		assert.Equal(t, []string{autoTag}, got.RemoveTags, "auto tag must be removed to break the loop")
+		assert.Equal(t, []string{failTag}, got.SuggestedTags, "fail tag must be added as a marker")
+		assert.True(t, got.KeepOriginalTags)
+	})
+
+	t.Run("zero disables the limit and retries forever", func(t *testing.T) {
+		autoTagMaxRetries = 0
+		client := newClient(12)
+		app := &App{Client: client}
+
+		for round := 1; round <= 5; round++ {
+			_, err := app.processAutoTagDocuments(context.Background())
+			assert.Error(t, err, "round %d should keep surfacing the error", round)
+		}
+		assert.Empty(t, client.calls, "with the limit disabled the document is never taken out of the queue")
+	})
+
+	t.Run("a cancelled context does not count against the document", func(t *testing.T) {
+		autoTagMaxRetries = 1
+		client := newClient(13)
+		app := &App{Client: client}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := app.processAutoTagDocuments(ctx)
+		assert.Error(t, err)
+		assert.Empty(t, client.calls,
+			"shutdown is not a document problem — it must not burn an attempt or fail-tag the document")
+	})
+}
+
+func TestProcessTagDocuments_WorkflowTriggerRemovedAfterMaxRetries(t *testing.T) {
+	prevFailTag, prevAutoTag, prevMaxRetries := failTag, autoTag, autoTagMaxRetries
+	t.Cleanup(func() {
+		failTag, autoTag, autoTagMaxRetries = prevFailTag, prevAutoTag, prevMaxRetries
+	})
+	failTag = "paperless-gpt-failed"
+	autoTag = "paperless-gpt-auto"
+	autoTagMaxRetries = 3
+	isolateWorkflowSettings(t)
+
+	const trigger = "paperless-gpt-invoices"
+	useWorkflows(t, []WorkflowConfig{{
+		ID:         "invoices",
+		TriggerTag: trigger,
+	}}...)
+
+	client := &recordingClient{
+		taggedDocuments: map[string][]Document{
+			trigger: {{ID: 21, Title: "Invoice", Tags: []string{trigger}}},
+		},
+		getAllTagsErr: errors.New("exceeds the available context size"),
+	}
+	app := &App{Client: client}
+
+	for round := 1; round <= 2; round++ {
+		count, err := app.processAutoTagDocuments(context.Background())
+		assert.Error(t, err, "round %d should surface the suggestion error", round)
+		assert.Equal(t, 0, count)
+		assert.Empty(t, client.calls, "no PATCH before the limit is reached")
+	}
+
+	count, err := app.processAutoTagDocuments(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, 0, count)
+	require.Len(t, client.calls, 1)
+	got := client.calls[0]
+	assert.Equal(t, 21, got.ID)
+	assert.Equal(t, []string{trigger}, got.RemoveTags, "the workflow trigger tag must be removed, not the global AUTO_TAG")
+	assert.Equal(t, []string{failTag}, got.SuggestedTags)
+	assert.NotContains(t, got.RemoveTags, autoTag)
+}
+
+// A workflow saved with enable_ocr while no OCR provider is configured (for
+// example before the provider was removed) can never succeed. The document
+// has to leave the loop on the first attempt instead of being fetched on
+// every poll.
+func TestProcessTagDocuments_WorkflowOCRWithoutProviderBreaksLoop(t *testing.T) {
+	prevFailTag, prevAutoTag := failTag, autoTag
+	t.Cleanup(func() { failTag, autoTag = prevFailTag, prevAutoTag })
+	failTag = "paperless-gpt-failed"
+	autoTag = "paperless-gpt-auto"
+	isolateWorkflowSettings(t)
+
+	const trigger = "paperless-gpt-scans"
+	on := true
+	useWorkflows(t, WorkflowConfig{ID: "scans", TriggerTag: trigger, EnableOCR: &on})
+
+	client := &recordingClient{
+		taggedDocuments: map[string][]Document{
+			trigger: {{ID: 31, Title: "Scan", Tags: []string{trigger}}},
+		},
+	}
+	app := &App{Client: client} // no OCR provider
+
+	_, _ = app.processAutoTagDocuments(context.Background())
+	require.Len(t, client.calls, 1, "the first attempt must already remove the trigger tag")
+	assert.Equal(t, []string{trigger}, client.calls[0].RemoveTags)
+	assert.Equal(t, []string{failTag}, client.calls[0].SuggestedTags)
+}
+
+func TestProcessAutoTagDocuments_SkipsWorkflowThatDuplicatesAutoTag(t *testing.T) {
+	prevAutoTag := autoTag
+	t.Cleanup(func() { autoTag = prevAutoTag })
+	autoTag = "paperless-gpt-auto"
+	isolateWorkflowSettings(t)
+
+	useWorkflows(t, WorkflowConfig{ID: "dup", TriggerTag: autoTag})
+
+	client := &recordingClient{taggedDocuments: map[string][]Document{}}
+	app := &App{Client: client}
+	count, err := app.processAutoTagDocuments(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+
+	autoFetches := 0
+	for _, tag := range client.tagFetches {
+		if tag == autoTag {
+			autoFetches++
+		}
+	}
+	assert.Equal(t, 1, autoFetches, "a workflow whose trigger is AUTO_TAG must not poll that tag a second time")
 }
