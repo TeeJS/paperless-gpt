@@ -49,7 +49,8 @@ var (
 	openaiAPIKey                  = os.Getenv("OPENAI_API_KEY")
 	manualTag                     = os.Getenv("MANUAL_TAG")
 	autoTag                       = os.Getenv("AUTO_TAG")
-	autoTagComplete               string // read via os.LookupEnv in validateOrDefaultEnvVars
+	autoTagComplete               string                        // read via os.LookupEnv in validateOrDefaultEnvVars
+	autoRemoveTags                []string                      // AUTO_REMOVE_TAGS: removed only after a fully successful auto-processing run
 	manualOcrTag                  = os.Getenv("MANUAL_OCR_TAG") // Not used yet
 	autoOcrTag                    = os.Getenv("AUTO_OCR_TAG")
 	failTag                       = os.Getenv("FAIL_TAG")
@@ -627,6 +628,15 @@ func validateOrDefaultEnvVars() {
 		fmt.Println("Auto tag complete is disabled")
 	}
 
+	if val := strings.TrimSpace(os.Getenv("AUTO_REMOVE_TAGS")); val != "" {
+		for _, t := range strings.Split(val, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				autoRemoveTags = append(autoRemoveTags, t)
+			}
+		}
+		fmt.Printf("Will remove %v after a complete auto-processing run\n", autoRemoveTags)
+	}
+
 	if paperlessBaseURL == "" {
 		log.Fatal("Please set the PAPERLESS_BASE_URL environment variable.")
 	}
@@ -1201,7 +1211,6 @@ func createVisionLLM() (llms.Model, error) {
 		return nil, nil
 	}
 }
-
 
 func createCustomHTTPClient() *http.Client {
 	// Create custom transport that adds headers

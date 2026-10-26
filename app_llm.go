@@ -98,6 +98,19 @@ func (app *App) getSuggestedTags(
 	availableTags []string,
 	originalTags []string,
 	logger *logrus.Entry) ([]string, error) {
+	tags, _, err := app.getSuggestedTagsDetailed(ctx, content, suggestedTitle, availableTags, originalTags, logger)
+	return tags, err
+}
+
+// getSuggestedTagsDetailed is getSuggestedTags but also returns the tags the
+// model answered with, before the document's original tags were merged in.
+func (app *App) getSuggestedTagsDetailed(
+	ctx context.Context,
+	content string,
+	suggestedTitle string,
+	availableTags []string,
+	originalTags []string,
+	logger *logrus.Entry) ([]string, []string, error) {
 	likelyLanguage := getLikelyLanguage()
 
 	templateMutex.RLock()
@@ -120,14 +133,14 @@ func (app *App) getSuggestedTags(
 	availableTokens, err := getAvailableTokensForContent(tagTemplate, templateData)
 	if err != nil {
 		logger.Errorf("Error calculating available tokens: %v", err)
-		return nil, fmt.Errorf("error calculating available tokens: %v", err)
+		return nil, nil, fmt.Errorf("error calculating available tokens: %v", err)
 	}
 
 	// Truncate content if needed
 	truncatedContent, err := truncateContentByTokens(content, availableTokens)
 	if err != nil {
 		logger.Errorf("Error truncating content: %v", err)
-		return nil, fmt.Errorf("error truncating content: %v", err)
+		return nil, nil, fmt.Errorf("error truncating content: %v", err)
 	}
 
 	// Execute template with truncated content
@@ -136,7 +149,7 @@ func (app *App) getSuggestedTags(
 	err = tagTemplate.Execute(&promptBuffer, templateData)
 	if err != nil {
 		logger.Errorf("Error executing tag template: %v", err)
-		return nil, fmt.Errorf("error executing tag template: %v", err)
+		return nil, nil, fmt.Errorf("error executing tag template: %v", err)
 	}
 
 	prompt := promptBuffer.String()
@@ -154,7 +167,7 @@ func (app *App) getSuggestedTags(
 	})
 	if err != nil {
 		logger.Errorf("Error getting response from LLM: %v", err)
-		return nil, fmt.Errorf("error getting response from LLM: %v", err)
+		return nil, nil, fmt.Errorf("error getting response from LLM: %v", err)
 	}
 
 	response := textsanitize.StripReasoning(completion.Choices[0].Content)
@@ -163,6 +176,10 @@ func (app *App) getSuggestedTags(
 	for i, tag := range suggestedTags {
 		suggestedTags[i] = strings.TrimSpace(tag)
 	}
+
+	// Keep what the model itself answered, before original tags are merged in,
+	// so triageComplete can tell a fresh year tag from an old one.
+	llmTags := slices.Clone(suggestedTags)
 
 	// append the original tags to the suggested tags
 	suggestedTags = append(suggestedTags, originalTags...)
@@ -190,7 +207,7 @@ func (app *App) getSuggestedTags(
 				}
 			}
 		}
-		return filteredTags, nil
+		return filteredTags, llmTags, nil
 	}
 
 	filteredTags := []string{}
@@ -203,7 +220,7 @@ func (app *App) getSuggestedTags(
 		}
 	}
 
-	return filteredTags, nil
+	return filteredTags, llmTags, nil
 }
 
 // getSuggestedDocumentType generates a suggested document type for a document using the LLM
@@ -399,6 +416,7 @@ func (app *App) getSuggestedCreatedDate(ctx context.Context, content string, log
 	result := textsanitize.StripReasoning(completion.Choices[0].Content)
 	return strings.TrimSpace(strings.Trim(result, "\"")), nil
 }
+
 var xmlAttrEscaper = strings.NewReplacer(
 	"&", "&amp;",
 	`"`, "&quot;",
@@ -415,6 +433,7 @@ var xmlTextEscaper = strings.NewReplacer(
 
 func escapeXMLAttr(s string) string { return xmlAttrEscaper.Replace(s) }
 func escapeXMLText(s string) string { return xmlTextEscaper.Replace(s) }
+
 // getSuggestedCustomFields generates suggested custom fields for a document using the LLM
 func (app *App) getSuggestedCustomFields(ctx context.Context, doc Document, selectedFieldIDs []int, logger *logrus.Entry) ([]CustomFieldSuggestion, error) {
 	// Fetch all available custom fields
@@ -602,6 +621,7 @@ func (app *App) generateDocumentSuggestions(ctx context.Context, suggestionReque
 			content := sanitize.Sanitize(doc.Content)
 			suggestedTitle := doc.Title
 			var suggestedTags []string
+			var llmTags []string
 			var suggestedCorrespondent string
 			var suggestedDocumentType string
 			var suggestedCreatedDate string
@@ -619,7 +639,7 @@ func (app *App) generateDocumentSuggestions(ctx context.Context, suggestionReque
 			}
 
 			if suggestionRequest.GenerateTags {
-				suggestedTags, err = app.getSuggestedTags(ctx, content, suggestedTitle, availableTagNames, doc.Tags, docLogger)
+				suggestedTags, llmTags, err = app.getSuggestedTagsDetailed(ctx, content, suggestedTitle, availableTagNames, doc.Tags, docLogger)
 				if err != nil {
 					mu.Lock()
 					errorsList = append(errorsList, fmt.Errorf("Document %d: %v", documentID, err))
@@ -749,6 +769,13 @@ func (app *App) generateDocumentSuggestions(ctx context.Context, suggestionReque
 				docLogger.Debugf("Adding auto-processing complete tag '%s'", app.autoTagComplete)
 			}
 
+			// Only for auto-processing: mark the document for AUTO_REMOVE_TAGS
+			// cleanup when the run fully triaged it (removed after the update succeeds).
+			if suggestionRequest.IsAutoProcessing && len(autoRemoveTags) > 0 {
+				suggestion.ClearTriage = triageComplete(suggestionRequest, suggestedTitle, llmTags, availableTagNames, suggestedDocumentType, availableDocumentTypeNames)
+				docLogger.Infof("Triage complete for document %d: %v", documentID, suggestion.ClearTriage)
+			}
+
 			documentSuggestions = append(documentSuggestions, suggestion)
 			mu.Unlock()
 
@@ -782,4 +809,74 @@ func stripMarkdown(content string) string {
 		content = strings.TrimSuffix(content, "```")
 	}
 	return strings.TrimSpace(content)
+}
+
+// triageComplete reports whether an auto-processing run fully triaged a
+// document, mirroring the paperless-triage skill: the model itself returned an
+// existing year tag, a document type from the existing list, and a title.
+// Anything missing means the document keeps its triage tag for human review.
+func triageComplete(req GenerateSuggestionsRequest, title string, llmTags, availableTags []string, docType string, availableDocTypes []string) bool {
+	if !req.GenerateTitles || strings.TrimSpace(title) == "" {
+		return false
+	}
+	if !req.GenerateDocumentTypes || docType == "" || !triageContainsFold(availableDocTypes, docType) {
+		return false
+	}
+	if !req.GenerateTags {
+		return false
+	}
+	for _, t := range llmTags {
+		if isYearTagName(t) && triageContainsFold(availableTags, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func isYearTagName(tag string) bool {
+	tag = strings.TrimSpace(tag)
+	if len(tag) != 4 {
+		return false
+	}
+	for _, r := range tag {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func triageContainsFold(list []string, s string) bool {
+	for _, item := range list {
+		if strings.EqualFold(strings.TrimSpace(item), strings.TrimSpace(s)) {
+			return true
+		}
+	}
+	return false
+}
+
+// removeTriageTags strips AUTO_REMOVE_TAGS from a document after a fully
+// successful auto-processing run. Failures are logged and leave the tag in place.
+func (app *App) removeTriageTags(ctx context.Context, documentID int, docLogger *logrus.Entry) {
+	current, err := app.Client.GetDocument(ctx, documentID)
+	if err != nil {
+		docLogger.Warnf("Could not re-read document %d to remove triage tags: %v", documentID, err)
+		return
+	}
+	has := false
+	for _, t := range current.Tags {
+		if triageContainsFold(autoRemoveTags, t) {
+			has = true
+			break
+		}
+	}
+	if !has {
+		return
+	}
+	cleanup := DocumentSuggestion{ID: documentID, OriginalDocument: current, RemoveTags: autoRemoveTags}
+	if err := app.Client.UpdateDocuments(ctx, []DocumentSuggestion{cleanup}, app.Database, false); err != nil {
+		docLogger.Warnf("Could not remove triage tags %v from document %d: %v", autoRemoveTags, documentID, err)
+		return
+	}
+	docLogger.Infof("Removed triage tags %v from document %d", autoRemoveTags, documentID)
 }

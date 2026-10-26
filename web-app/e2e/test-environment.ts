@@ -101,7 +101,7 @@ export async function setupTestEnvironment(config?: TestEnvironmentConfig): Prom
       .withNetworkAliases('paperless-ngx')
       .withEnvironment({
         PAPERLESS_URL: `http://localhost:${paperlessPort}`,
-        PAPERLESS_SECRET_KEY: 'change-me',
+        PAPERLESS_SECRET_KEY: 'e2e-test-only-secret-key-not-for-production',
         PAPERLESS_ADMIN_USER: 'admin',
         PAPERLESS_ADMIN_PASSWORD: 'admin',
         PAPERLESS_TIME_ZONE: 'Europe/Berlin',
@@ -262,19 +262,28 @@ export async function uploadDocument(
       throw new Error(`Failed to check task status: ${taskResponse.statusText}`);
     }
 
-    const taskResultArr = await taskResponse.json();
-    console.log(`Task status: ${JSON.stringify(taskResultArr)}`);
+    const taskJson = await taskResponse.json();
+    console.log(`Task status: ${JSON.stringify(taskJson)}`);
 
+    // Older paperless-ngx returns a plain array; newer versions return a paginated object
+    const taskResultArr = Array.isArray(taskJson) ? taskJson : (taskJson?.results ?? []);
     if (taskResultArr.length === 0) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
       continue;
     }
     const taskResult = taskResultArr[0];
+    const status = String(taskResult.status ?? '').toUpperCase();
+    // Newer versions report the document in related_document_ids; older ones in related_document / id
+    const documentId = taskResult.related_document_ids?.[0]
+      ?? taskResult.related_document
+      ?? taskResult.result_data?.document_id
+      ?? taskResult.id;
     // Check if task is completed
-    if (taskResult.status === 'SUCCESS' && taskResult.id) {
-      console.log(`Document processed successfully with ID: ${taskResult.id}`);
+    if (status === 'SUCCESS' && documentId) {
+      console.log(`Document processed successfully with ID: ${documentId}`);
       
       // Fetch the complete document details
-      const documentResponse = await fetch(`${baseUrl}/api/documents/${taskResult.id}/`, {
+      const documentResponse = await fetch(`${baseUrl}/api/documents/${documentId}/`, {
         headers: {
           'Authorization': 'Basic ' + btoa(`${credentials.username}:${credentials.password}`),
         },
@@ -288,8 +297,8 @@ export async function uploadDocument(
     }
     
     // Check for failure
-    if (taskResult.status === 'FAILED') {
-      throw new Error(`Document processing failed: ${taskResult.result}`);
+    if (status === 'FAILED' || status === 'FAILURE') {
+      throw new Error(`Document processing failed: ${JSON.stringify(taskResult.result ?? taskResult.result_data)}`);
     }
     
     // Wait before polling again
