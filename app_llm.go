@@ -458,7 +458,25 @@ func (app *App) getSuggestedCreatedDate(ctx context.Context, content string, log
 	result = strings.TrimSpace(strings.Trim(result, "\""))
 	// paperless-ngx only accepts YYYY-MM-DD. Models often emit the same
 	// date with dots or slashes, which then fails validation and is dropped.
-	return normalizeCreatedDate(result), nil
+	date := normalizeCreatedDate(result)
+	// Drop a date whose year the model invented: keep it only if that year is
+	// written in the content it was shown. An empty suggestion leaves the
+	// document's existing created date untouched.
+	if !createdDateYearSupported(date, truncatedContent) {
+		logger.Infof("Dropping createdDate %q: year not found in document content", date)
+		return "", nil
+	}
+	return date, nil
+}
+
+// createdDateYearSupported reports whether a YYYY-MM-DD date's year appears in
+// content. Empty or non-YYYY-MM-DD values are passed through as supported so
+// existing validation downstream still handles them.
+func createdDateYearSupported(date, content string) bool {
+	if len(date) < 10 || date[4] != '-' || !isYearTagName(date[:4]) {
+		return true
+	}
+	return yearInContent(date[:4], content)
 }
 
 var xmlAttrEscaper = strings.NewReplacer(
